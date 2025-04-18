@@ -20,4 +20,13 @@ void custom_free(void* ptr);
 // Function to assign one pointer to another
 void assign(void** dest, void* src);
 
+// Function to increment reference count
+void increment_ref(void* ptr);
+
+// Function to decrement reference count
+void decrement_ref(void* ptr);
+
+// Function to free the entire memory pool
+void free_memory_pool(void);
+
 #endif // CUSTOM_MEMORY_H 
