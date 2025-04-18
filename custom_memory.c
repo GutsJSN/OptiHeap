@@ -8,23 +8,34 @@
 #include <stdlib.h>
 
 #define MEMORY_POOL_SIZE (64 * 1024) // 64KB
+#define ALIGNMENT 8 // Align to 8-byte boundaries
 
-typedef struct Block {
-    void* address;
-    size_t size;
-    int ref_count;
-    struct Block* next;
-} Block;
-
-typedef struct FreeBlock {
-    size_t size;
-    struct FreeBlock* next;
-} FreeBlock;
+// Metadata stored at the beginning of each allocated block
+typedef struct BlockHeader {
+    size_t size;          // Size of the user data
+    int ref_count;        // Reference count
+    struct BlockHeader* next_free; // Pointer to next free block (used when in free list)
+} BlockHeader;
 
 static void* memory_pool = NULL;
 static size_t memory_pool_size = 0;
-static Block* allocated_blocks = NULL;
-static FreeBlock* free_list = NULL;
+static BlockHeader* free_list = NULL;
+static BlockHeader* allocated_blocks = NULL;
+
+// Returns the total size needed for a block including its header
+static size_t total_size(size_t user_size) {
+    return ((sizeof(BlockHeader) + user_size + (ALIGNMENT - 1)) & ~(ALIGNMENT - 1));
+}
+
+// Returns a pointer to user data from a block header
+static void* block_to_ptr(BlockHeader* block) {
+    return (void*)((char*)block + sizeof(BlockHeader));
+}
+
+// Returns a pointer to block header from user data
+static BlockHeader* ptr_to_block(void* ptr) {
+    return (BlockHeader*)((char*)ptr - sizeof(BlockHeader));
+}
 
 // Function to initialize the memory pool
 void init_memory_pool(size_t size) {
@@ -35,99 +46,113 @@ void init_memory_pool(size_t size) {
             memory_pool = NULL;
         } else {
             memory_pool_size = size;
-            memset(memory_pool, 0, size); // Initialize memory to zero
+            memset(memory_pool, 0, size);
+            
+            // Initialize free list with the entire pool
+            free_list = (BlockHeader*)memory_pool;
+            free_list->size = size - sizeof(BlockHeader);
+            free_list->ref_count = 0;
+            free_list->next_free = NULL;
         }
     }
 }
 
 // Function to allocate memory from the pool
 void* custom_malloc(size_t size) {
-    // Align size to ensure proper alignment
-    size = (size + sizeof(size_t) - 1) & ~(sizeof(size_t) - 1);
-
-    // Check if there's a suitable free block
-    FreeBlock** current = &free_list;
-    while (*current) {
-        if ((*current)->size >= size) {
-            // Found a suitable block
-            FreeBlock* block = *current;
-            *current = (*current)->next;
-            
-            // Create a tracking block
-            Block* new_block = (Block*)malloc(sizeof(Block));
-            new_block->address = (void*)block;
-            new_block->size = size;
-            new_block->ref_count = 1;
-            new_block->next = allocated_blocks;
-            allocated_blocks = new_block;
-            
-            printf("Allocated memory at %p of size %zu from free list\n", new_block->address, new_block->size);
-            return new_block->address;
-        }
-        current = &(*current)->next;
-    }
-
-    // No suitable free block found, allocate from the pool
-    if (memory_pool == NULL || size > memory_pool_size) {
+    if (size == 0 || memory_pool == NULL) {
         return NULL;
     }
     
-    void* ptr = memory_pool;
-    memory_pool = (char*)memory_pool + size;
-    memory_pool_size -= size;
-
-    // Create a tracking block
-    Block* new_block = (Block*)malloc(sizeof(Block));
-    new_block->address = ptr;
-    new_block->size = size;
-    new_block->ref_count = 1;
-    new_block->next = allocated_blocks;
-    allocated_blocks = new_block;
+    // Calculate the total size needed including header
+    size_t block_size = total_size(size);
     
-    printf("Allocated memory at %p of size %zu from pool\n", new_block->address, new_block->size);
-    return ptr;
+    // Find a suitable free block
+    BlockHeader** current = &free_list;
+    BlockHeader* prev = NULL;
+    
+    while (*current) {
+        if ((*current)->size >= block_size) {
+            // Found a suitable block
+            BlockHeader* found_block = *current;
+            
+            // Remove from free list
+            *current = found_block->next_free;
+            
+            // Split the block if it's significantly larger
+            if (found_block->size >= block_size + sizeof(BlockHeader) + ALIGNMENT) {
+                // Calculate the size for the new free block
+                size_t remaining_size = found_block->size - block_size;
+                
+                // Create a new free block in the remaining space
+                BlockHeader* new_free = (BlockHeader*)((char*)found_block + block_size);
+                new_free->size = remaining_size - sizeof(BlockHeader);
+                new_free->ref_count = 0;
+                new_free->next_free = free_list;
+                free_list = new_free;
+                
+                // Adjust the size of the found block
+                found_block->size = block_size - sizeof(BlockHeader);
+            }
+            
+            // Initialize the block
+            found_block->ref_count = 1;
+            
+            // Add to allocated blocks list
+            found_block->next_free = (BlockHeader*)allocated_blocks;
+            allocated_blocks = found_block;
+            
+            void* user_ptr = block_to_ptr(found_block);
+            printf("Allocated memory at %p of size %zu\n", user_ptr, size);
+            return user_ptr;
+        }
+        prev = *current;
+        current = &(*current)->next_free;
+    }
+    
+    printf("Memory allocation failed: Not enough memory in pool\n");
+    return NULL;
 }
 
 // Function to increment reference count
 void increment_ref(void* ptr) {
-    Block* current = allocated_blocks;
-    while (current) {
-        if (current->address == ptr) {
-            current->ref_count++;
-            printf("Incrementing ref count for %p, new count: %d\n", ptr, current->ref_count);
-            return;
-        }
-        current = current->next;
+    if (ptr == NULL) {
+        printf("Cannot increment reference count of NULL pointer\n");
+        return;
     }
-    printf("Pointer not found in allocated blocks\n");
+    
+    BlockHeader* block = ptr_to_block(ptr);
+    block->ref_count++;
+    printf("Incrementing ref count for %p, new count: %d\n", ptr, block->ref_count);
 }
 
 // Function to decrement reference count and free memory if needed
 void decrement_ref(void* ptr) {
-    Block** current = &allocated_blocks;
-    while (*current) {
-        if ((*current)->address == ptr) {
-            (*current)->ref_count--;
-            printf("Decrementing ref count for %p, new count: %d\n", ptr, (*current)->ref_count);
-            if ((*current)->ref_count <= 0) {
-                // Add the block to the free list
-                FreeBlock* block = (FreeBlock*)ptr;
-                block->size = (*current)->size;
-                block->next = free_list;
-                free_list = block;
-                
-                printf("Added memory at %p of size %zu to free list\n", ptr, (*current)->size);
-
-                // Remove the block from the tracking list
-                Block* to_free = *current;
-                *current = (*current)->next;
-                free(to_free);
-            }
-            return;
-        }
-        current = &(*current)->next;
+    if (ptr == NULL) {
+        printf("Cannot decrement reference count of NULL pointer\n");
+        return;
     }
-    printf("Pointer not found in allocated blocks\n");
+    
+    BlockHeader* block = ptr_to_block(ptr);
+    block->ref_count--;
+    printf("Decrementing ref count for %p, new count: %d\n", ptr, block->ref_count);
+    
+    if (block->ref_count <= 0) {
+        // Remove from allocated blocks list
+        BlockHeader** current = (BlockHeader**)&allocated_blocks;
+        while (*current && *current != block) {
+            current = (BlockHeader**)&(*current)->next_free;
+        }
+        
+        if (*current) {
+            *current = (BlockHeader*)block->next_free;
+        }
+        
+        // Add to free list
+        block->next_free = free_list;
+        free_list = block;
+        
+        printf("Added memory at %p of size %zu to free list\n", ptr, block->size);
+    }
 }
 
 // Function to free memory explicitly
@@ -160,15 +185,7 @@ void free_memory_pool(void) {
         }
         memory_pool = NULL;
         memory_pool_size = 0;
-        
-        // Free all allocated blocks
-        while (allocated_blocks) {
-            Block* to_free = allocated_blocks;
-            allocated_blocks = allocated_blocks->next;
-            free(to_free);
-        }
-        
-        // Clear the free list
+        allocated_blocks = NULL;
         free_list = NULL;
     }
 } 
